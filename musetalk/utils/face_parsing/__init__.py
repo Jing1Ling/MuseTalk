@@ -8,7 +8,8 @@ from .model import BiSeNet
 import torchvision.transforms as transforms
 
 class FaceParsing():
-    def __init__(self, left_cheek_width=80, right_cheek_width=80):
+    def __init__(self, left_cheek_width=80, right_cheek_width=80, device="hpu"):
+        self.device = torch.device(device) if type(device) is str else device
         self.net = self.model_init()
         self.preprocess = self.image_preprocess()
         # Ensure all size parameters are integers
@@ -64,7 +65,7 @@ class FaceParsing():
             net.cuda()
             net.load_state_dict(torch.load(model_pth)) 
         else:
-            net.load_state_dict(torch.load(model_pth, map_location=torch.device('cpu')))
+            net.load_state_dict(torch.load(model_pth, map_location=self.device))
         net.eval()
         return net
 

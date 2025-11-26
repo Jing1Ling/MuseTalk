@@ -388,7 +388,7 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
 
 
 # load model weights
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = "hpu"
 vae, unet, pe = load_all_model(
     unet_model_path="./models/musetalkV15/unet.pth", 
     vae_type="sd-vae",

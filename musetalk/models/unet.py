@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import habana_frameworks.torch as htorch
 import math
 import json
 
@@ -41,7 +42,7 @@ class UNet():
             self.device = device
         else:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        weights = torch.load(model_path) if torch.cuda.is_available() else torch.load(model_path, map_location=self.device)
+        weights = torch.load(model_path, map_location=self.device)
         self.model.load_state_dict(weights)
         if use_float16:
             self.model = self.model.half()
