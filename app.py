@@ -474,10 +474,10 @@ def check_video(video):
     t_idx = 0
     target_frames = []
     for target_t in range(1, L_target+1):
-        while target_t / target_fps > original_t[t_idx]:
-            t_idx += 1      # find the first t_idx so that target_t / target_fps <= original_t[t_idx]
-            if t_idx >= L:
-                break
+        while t_idx < L and target_t / target_fps > original_t[t_idx]:
+            t_idx += 1
+        if t_idx >= L:
+            t_idx = L - 1
         target_frames.append(frames[t_idx])
 
     # save video
