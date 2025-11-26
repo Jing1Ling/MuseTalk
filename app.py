@@ -160,8 +160,8 @@ def print_directory_contents(path):
 def download_model():
     # 检查必需的模型文件是否存在
     required_models = {
-        "MuseTalk": f"{CheckpointsDir}/musetalkV15/unet.pth",
-        "MuseTalk": f"{CheckpointsDir}/musetalkV15/musetalk.json",
+        "MuseTalk UNet": f"{CheckpointsDir}/musetalkV15/unet.pth",
+        "MuseTalk Config": f"{CheckpointsDir}/musetalkV15/musetalk.json",
         "SD VAE": f"{CheckpointsDir}/sd-vae/config.json",
         "Whisper": f"{CheckpointsDir}/whisper/config.json",
         "DWPose": f"{CheckpointsDir}/dwpose/dw-ll_ucoco_384.pth",
