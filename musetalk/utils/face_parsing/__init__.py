@@ -66,6 +66,7 @@ class FaceParsing():
             net.load_state_dict(torch.load(model_pth)) 
         else:
             net.load_state_dict(torch.load(model_pth, map_location=self.device))
+        net.to(self.device)
         net.eval()
         return net
 
@@ -83,10 +84,11 @@ class FaceParsing():
         with torch.no_grad():
             image = image.resize(size, Image.BILINEAR)
             img = self.preprocess(image)
-            if torch.cuda.is_available():
-                img = torch.unsqueeze(img, 0).cuda()
-            else:
-                img = torch.unsqueeze(img, 0)
+            img = torch.unsqueeze(img, 0).to(self.device)
+            # if torch.cuda.is_available():
+            #     img = torch.unsqueeze(img, 0).cuda()
+            # else:
+            #     img = torch.unsqueeze(img, 0)
             out = self.net(img)[0]
             parsing = out.squeeze(0).cpu().numpy().argmax(0)
             
