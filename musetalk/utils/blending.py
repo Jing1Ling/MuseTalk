@@ -93,6 +93,68 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
     return body[:, :, ::-1]  # 返回处理后的图像（BGR 转 RGB）
 
 
+def get_blending_mask(image, face_box, upper_boundary_ratio=0.5, expand=1.5, mode="raw", fp=None):
+    # 将 numpy 数组转换为 PIL 图像
+    body = Image.fromarray(image[:, :, ::-1])  # 身体部分图像(整张图)
+
+    x, y, x1, y1 = face_box  # 获取面部边界框的坐标
+    crop_box, s = get_crop_box(face_box, expand)  # 计算扩展后的裁剪框
+    x_s, y_s, x_e, y_e = crop_box  # 裁剪框的坐标
+    face_position = (x, y)  # 面部在原始图像中的位置
+
+    # 从身体图像中裁剪出扩展后的面部区域（下巴到边界有距离）
+    face_large = body.crop(crop_box)
+        
+    ori_shape = face_large.size  # 裁剪后图像的原始尺寸
+
+    # 对裁剪后的面部区域进行面部解析，生成掩码
+    mask_image = face_seg(face_large, mode=mode, fp=fp)
+    
+    mask_small = mask_image.crop((x - x_s, y - y_s, x1 - x_s, y1 - y_s))  # 裁剪出面部区域的掩码
+    
+    mask_image = Image.new('L', ori_shape, 0)  # 创建一个全黑的掩码图像
+    mask_image.paste(mask_small, (x - x_s, y - y_s, x1 - x_s, y1 - y_s))  # 将面部掩码粘贴到全黑图像上
+    
+    
+    # 保留面部区域的上半部分（用于控制说话区域）
+    width, height = mask_image.size
+    top_boundary = int(height * upper_boundary_ratio)  # 计算上半部分的边界
+    modified_mask_image = Image.new('L', ori_shape, 0)  # 创建一个新的全黑掩码图像
+    modified_mask_image.paste(mask_image.crop((0, top_boundary, width, height)), (0, top_boundary))  # 粘贴上半部分掩码
+    
+    
+    # 对掩码进行高斯模糊，使边缘更平滑
+    blur_kernel_size = int(0.05 * ori_shape[0] // 2 * 2) + 1  # 计算模糊核大小
+    mask_array = cv2.GaussianBlur(np.array(modified_mask_image), (blur_kernel_size, blur_kernel_size), 0)  # 高斯模糊
+    #mask_array = np.array(modified_mask_image)
+    mask_image = Image.fromarray(mask_array)  # 将模糊后的掩码转换回 PIL 图像
+    return mask_image, crop_box
+    # # 将裁剪的面部图像粘贴回扩展后的面部区域
+    # face_large.paste(face, (x - x_s, y - y_s, x1 - x_s, y1 - y_s))
+    
+    # body.paste(face_large, crop_box[:2], mask_image)
+    
+    # body = np.array(body)  # 将 PIL 图像转换回 numpy 数组
+
+    # return body[:, :, ::-1]  # 返回处理后的图像（BGR 转 RGB）
+def get_image_blending_from_mask_info(image, face, face_box, mask_image, crop_box):
+    body = Image.fromarray(image[:,:,::-1])
+    face = Image.fromarray(face[:,:,::-1])
+
+    x, y, x1, y1 = face_box
+    x_s, y_s, x_e, y_e = crop_box
+    face_large = body.crop(crop_box)
+    # print(face_large.size)
+    # print(mask_image.size)
+    # print(crop_box)
+    # print(face.size)
+    # print(face_box)
+    face_large.paste(face, (x-x_s, y-y_s, x1-x_s, y1-y_s))
+    body.paste(face_large, crop_box[:2], mask_image)
+    body = np.array(body)
+    return body #[:,:,::-1]
+
+
 def get_image_blending(image, face, face_box, mask_array, crop_box):
     body = Image.fromarray(image[:,:,::-1])
     face = Image.fromarray(face[:,:,::-1])
