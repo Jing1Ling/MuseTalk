@@ -20,6 +20,8 @@ from moviepy.editor import VideoFileClip, AudioFileClip
 from transformers import WhisperModel
 import gradio as gr
 
+from musetalk.utils.blending import get_blending_mask, get_image, get_image_blending, get_image_blending_from_mask_info
+
 inpainting_infer_ps = None
 task_queue = None
 result_queue = None
@@ -298,12 +300,14 @@ def infer(pe, vae, unet, timesteps, audio_processor, whisper,
     # Initialize face parser
     fp = FaceParsing(
         left_cheek_width=args.left_cheek_width,
-        right_cheek_width=args.right_cheek_width
+        right_cheek_width=args.right_cheek_width,
+        device="hpu"
     )
     
     i = 0
     input_latent_list = []
-    for bbox, frame in zip(coord_list, frame_list):
+    input_blending_mask_info_list = []
+    for bbox, frame in  tqdm(zip(coord_list, frame_list), total=len(coord_list)):
         if bbox == coord_placeholder:
             continue
         x1, y1, x2, y2 = bbox
@@ -314,20 +318,28 @@ def infer(pe, vae, unet, timesteps, audio_processor, whisper,
         latents = vae.get_latents_for_unet(crop_frame)
         input_latent_list.append(latents)
 
+        if args.version == "v15":
+            blending_mask, crop_bbox = get_blending_mask(frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+        else:
+            blending_mask, crop_bbox = get_blending_mask(frame, [x1, y1, x2, y2], fp=fp)
+        input_blending_mask_info_list.append((blending_mask, crop_bbox))
+
     # to smooth the first and the last frame
     frame_list_cycle = frame_list + frame_list[::-1]
     coord_list_cycle = coord_list + coord_list[::-1]
     input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
+    input_blending_mask_info_list = input_blending_mask_info_list + input_blending_mask_info_list[::-1]
     
     ############################################## inference batch by batch ##############################################
     print("start inference")
     video_num = len(whisper_chunks)
     batch_size = args.batch_size
+    delay_frame = 0
     gen = datagen(
         whisper_chunks=whisper_chunks,
         vae_encode_latents=input_latent_list_cycle,
         batch_size=batch_size,
-        delay_frame=0,
+        delay_frame=delay_frame,
         device=device,
     )
     res_frame_list = []
@@ -342,10 +354,30 @@ def infer(pe, vae, unet, timesteps, audio_processor, whisper,
             res_frame_list.append(res_frame)
             
     ############################################## pad to full image ##############################################
+    height, width, _ = frame_list[0].shape
+    temp_vid_path = 'temp.mp4'
+    ffmpeg_cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-pix_fmt", "rgb24",
+        "-s", f"{width}x{height}",
+        "-r", str(fps),
+        "-i", "-",                    # stdin 输入
+        "-an",
+        "-vcodec", "libx264",
+        "-preset", "fast",
+        "-pix_fmt", "yuv420p",
+        "-crf", "18",
+        temp_vid_path
+    ]
+    process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
+
     print("pad talking image to original video")
     for i, res_frame in enumerate(tqdm(res_frame_list)):
-        bbox = coord_list_cycle[i%(len(coord_list_cycle))]
-        ori_frame = copy.deepcopy(frame_list_cycle[i%(len(frame_list_cycle))])
+        bbox = coord_list_cycle[(i+delay_frame)%(len(coord_list_cycle))]
+        ori_frame = copy.deepcopy(frame_list_cycle[(i+delay_frame)%(len(frame_list_cycle))])
+        blending_mask, crop_bbox = input_blending_mask_info_list[(i+delay_frame)%(len(coord_list_cycle))]
         x1, y1, x2, y2 = bbox
         y2 = y2 + args.extra_margin
         y2 = min(y2, frame.shape[0])
@@ -353,33 +385,17 @@ def infer(pe, vae, unet, timesteps, audio_processor, whisper,
             res_frame = cv2.resize(res_frame.astype(np.uint8),(x2-x1,y2-y1))
         except:
             continue
-        
+
         # Use v15 version blending
-        combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
-            
-        cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png",combine_frame)
-        
-    # Frame rate
-    fps = 25
-    # Output video path
-    output_video = 'temp.mp4'
+        combine_frame = get_image_blending_from_mask_info(ori_frame, res_frame, [x1, y1, x2, y2], blending_mask, crop_bbox)
 
-    # Read images
-    def is_valid_image(file):
-        pattern = re.compile(r'\d{8}\.png')
-        return pattern.match(file)
+        # combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+        process.stdin.write(combine_frame.astype(np.uint8).tobytes())
+        # cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png",combine_frame)
 
-    images = []
-    files = [file for file in os.listdir(result_img_save_path) if is_valid_image(file)]
-    files.sort(key=lambda x: int(x.split('.')[0]))
-
-    for file in files:
-        filename = os.path.join(result_img_save_path, file)
-        images.append(imageio.imread(filename))
-        
-
-    # Save video
-    imageio.mimwrite(output_video, images, 'FFMPEG', fps=fps, codec='libx264', pixelformat='yuv420p')
+    process.stdin.close()
+    process.wait()
+    print("Video saved to", temp_vid_path)
 
     input_video = './temp.mp4'
     # Check if the input_video and audio_path exist
@@ -387,32 +403,15 @@ def infer(pe, vae, unet, timesteps, audio_processor, whisper,
         raise FileNotFoundError(f"Input video file not found: {input_video}")
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
-    
-    # Read video
-    reader = imageio.get_reader(input_video)
-    fps = reader.get_meta_data()['fps']  # Get original video frame rate
-    reader.close() # Otherwise, error on win11: PermissionError: [WinError 32] Another program is using this file, process cannot access. : 'temp.mp4'
-    # Store frames in list
-    frames = images
-    
-    print(len(frames))
 
-    # Load the video
-    video_clip = VideoFileClip(input_video)
-
-    # Load the audio
-    audio_clip = AudioFileClip(audio_path)
-
-    # Set the audio to the video
-    video_clip = video_clip.set_audio(audio_clip)
-
-    # Write the output video
-    video_clip.write_videofile(output_vid_name, codec='libx264', audio_codec='aac',fps=25)
+    cmd_combine_audio = f"ffmpeg -y -v warning -i {audio_path} -i {temp_vid_path} {output_vid_name}"
+    print("Audio combination command:", cmd_combine_audio) 
+    os.system(cmd_combine_audio)
 
     os.remove("temp.mp4")
-    #shutil.rmtree(result_img_save_path)
+    # shutil.rmtree(result_img_save_path)
     print(f"result is save to {output_vid_name}")
-    return output_vid_name,bbox_shift_text
+    return output_vid_name, bbox_shift_text
 
 @torch.no_grad()
 def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode="jaw",
