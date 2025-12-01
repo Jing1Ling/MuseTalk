@@ -1,0 +1,179 @@
+From a9af95018aa835d9b7f19895fd0675429987de73 Mon Sep 17 00:00:00 2001
+From: Jing <jing1.ling@intel.com>
+Date: Wed, 26 Nov 2025 15:43:03 +0800
+Subject: [PATCH 1/7] Set default device to HPU for demo, normal and realtime
+ modes
+
+---
+ app.py                                          |  2 +-
+ musetalk/models/unet.py                         |  3 ++-
+ musetalk/models/vae.py                          |  3 ++-
+ musetalk/utils/face_detection/detection/core.py |  2 +-
+ musetalk/utils/face_parsing/__init__.py         | 15 +++++++++------
+ musetalk/utils/face_parsing/resnet.py           |  2 +-
+ musetalk/utils/preprocessing.py                 |  3 +--
+ scripts/inference.py                            |  2 +-
+ scripts/realtime_inference.py                   |  2 +-
+ 9 files changed, 19 insertions(+), 15 deletions(-)
+
+diff --git a/app.py b/app.py
+index 448e641..98657c8 100644
+--- a/app.py
++++ b/app.py
+@@ -388,7 +388,7 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
+ 
+ 
+ # load model weights
+-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++device = "hpu"
+ vae, unet, pe = load_all_model(
+     unet_model_path="./models/musetalkV15/unet.pth", 
+     vae_type="sd-vae",
+diff --git a/musetalk/models/unet.py b/musetalk/models/unet.py
+index 575e79a..387ad79 100755
+--- a/musetalk/models/unet.py
++++ b/musetalk/models/unet.py
+@@ -1,5 +1,6 @@
+ import torch
+ import torch.nn as nn
++import habana_frameworks.torch as htorch
+ import math
+ import json
+ 
+@@ -41,7 +42,7 @@ class UNet():
+             self.device = device
+         else:
+             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+-        weights = torch.load(model_path) if torch.cuda.is_available() else torch.load(model_path, map_location=self.device)
++        weights = torch.load(model_path, map_location=self.device)
+         self.model.load_state_dict(weights)
+         if use_float16:
+             self.model = self.model.half()
+diff --git a/musetalk/models/vae.py b/musetalk/models/vae.py
+index 51efef4..ae75d82 100755
+--- a/musetalk/models/vae.py
++++ b/musetalk/models/vae.py
+@@ -23,7 +23,8 @@ class VAE():
+         self.model_path = model_path
+         self.vae = AutoencoderKL.from_pretrained(self.model_path)
+ 
+-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++        # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++        self.device = torch.device("hpu")
+         self.vae.to(self.device)
+ 
+         if use_float16:
+diff --git a/musetalk/utils/face_detection/detection/core.py b/musetalk/utils/face_detection/detection/core.py
+index 0f8275e..d3afa2d 100755
+--- a/musetalk/utils/face_detection/detection/core.py
++++ b/musetalk/utils/face_detection/detection/core.py
+@@ -24,7 +24,7 @@ class FaceDetector(object):
+                 logger = logging.getLogger(__name__)
+                 logger.warning("Detection running on CPU, this may be potentially slow.")
+ 
+-        if 'cpu' not in device and 'cuda' not in device:
++        if 'cpu' not in device and 'cuda' not in device and "hpu" not in device:
+             if verbose:
+                 logger.error("Expected values for device are: {cpu, cuda} but got: %s", device)
+             raise ValueError
+diff --git a/musetalk/utils/face_parsing/__init__.py b/musetalk/utils/face_parsing/__init__.py
+index 09c1c02..0bb8fbe 100755
+--- a/musetalk/utils/face_parsing/__init__.py
++++ b/musetalk/utils/face_parsing/__init__.py
+@@ -8,7 +8,8 @@ from .model import BiSeNet
+ import torchvision.transforms as transforms
+ 
+ class FaceParsing():
+-    def __init__(self, left_cheek_width=80, right_cheek_width=80):
++    def __init__(self, left_cheek_width=80, right_cheek_width=80, device="hpu"):
++        self.device = torch.device(device) if type(device) is str else device
+         self.net = self.model_init()
+         self.preprocess = self.image_preprocess()
+         # Ensure all size parameters are integers
+@@ -64,7 +65,8 @@ class FaceParsing():
+             net.cuda()
+             net.load_state_dict(torch.load(model_pth)) 
+         else:
+-            net.load_state_dict(torch.load(model_pth, map_location=torch.device('cpu')))
++            net.load_state_dict(torch.load(model_pth, map_location=self.device))
++        net.to(self.device)
+         net.eval()
+         return net
+ 
+@@ -82,10 +84,11 @@ class FaceParsing():
+         with torch.no_grad():
+             image = image.resize(size, Image.BILINEAR)
+             img = self.preprocess(image)
+-            if torch.cuda.is_available():
+-                img = torch.unsqueeze(img, 0).cuda()
+-            else:
+-                img = torch.unsqueeze(img, 0)
++            img = torch.unsqueeze(img, 0).to(self.device)
++            # if torch.cuda.is_available():
++            #     img = torch.unsqueeze(img, 0).cuda()
++            # else:
++            #     img = torch.unsqueeze(img, 0)
+             out = self.net(img)[0]
+             parsing = out.squeeze(0).cpu().numpy().argmax(0)
+             
+diff --git a/musetalk/utils/face_parsing/resnet.py b/musetalk/utils/face_parsing/resnet.py
+index e2e5d87..a306abb 100755
+--- a/musetalk/utils/face_parsing/resnet.py
++++ b/musetalk/utils/face_parsing/resnet.py
+@@ -80,7 +80,7 @@ class Resnet18(nn.Module):
+         return feat8, feat16, feat32
+ 
+     def init_weight(self, model_path):
+-        state_dict = torch.load(model_path) #modelzoo.load_url(resnet18_url)
++        state_dict = torch.load(model_path, weights_only=False) #modelzoo.load_url(resnet18_url)
+         self_state_dict = self.state_dict()
+         for k, v in state_dict.items():
+             if 'fc' in k: continue
+diff --git a/musetalk/utils/preprocessing.py b/musetalk/utils/preprocessing.py
+index 978480c..655afa1 100755
+--- a/musetalk/utils/preprocessing.py
++++ b/musetalk/utils/preprocessing.py
+@@ -13,13 +13,12 @@ import torch
+ from tqdm import tqdm
+ 
+ # initialize the mmpose model
+-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++device = "hpu"
+ config_file = './musetalk/utils/dwpose/rtmpose-l_8xb32-270e_coco-ubody-wholebody-384x288.py'
+ checkpoint_file = './models/dwpose/dw-ll_ucoco_384.pth'
+ model = init_model(config_file, checkpoint_file, device=device)
+ 
+ # initialize the face detection model
+-device = "cuda" if torch.cuda.is_available() else "cpu"
+ fa = FaceAlignment(LandmarksType._2D, flip_input=False,device=device)
+ 
+ # maker if the bbox is not sufficient 
+diff --git a/scripts/inference.py b/scripts/inference.py
+index 428afb9..1f58c9a 100644
+--- a/scripts/inference.py
++++ b/scripts/inference.py
+@@ -39,7 +39,7 @@ def main(args):
+             print("Warning: Unable to find ffmpeg, please ensure ffmpeg is properly installed")
+     
+     # Set computing device
+-    device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
++    device = "hpu"
+     # Load model weights
+     vae, unet, pe = load_all_model(
+         unet_model_path=args.unet_model_path, 
+diff --git a/scripts/realtime_inference.py b/scripts/realtime_inference.py
+index 579b050..0a79be4 100644
+--- a/scripts/realtime_inference.py
++++ b/scripts/realtime_inference.py
+@@ -352,7 +352,7 @@ if __name__ == "__main__":
+             print("Warning: Unable to find ffmpeg, please ensure ffmpeg is properly installed")
+ 
+     # Set computing device
+-    device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
++    device = "hpu"
+ 
+     # Load model weights
+     vae, unet, pe = load_all_model(
+-- 
+2.43.0
+

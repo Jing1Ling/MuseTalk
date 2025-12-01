@@ -1,0 +1,27 @@
+services:
+  MuseTalk-WebUI:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        http_proxy: ${http_proxy}
+        https_proxy: ${https_proxy}
+        no_proxy: ${no_proxy}
+    image: aisolution-musetalk:latest
+    container_name: aisolution-musetalk
+    runtime: habana
+    tty: true
+    stdin_open: true
+    environment:
+      - HABANA_VISIBLE_DEVICES=all
+      - OMPI_MCA_btl_vader_single_copy_mechanism=none
+      - http_proxy=${http_proxy}
+      - https_proxy=${https_proxy}
+      - no_proxy=${no_proxy}
+    cap_add:
+      - SYS_NICE
+    network_mode: host
+    ipc: host
+    working_dir: /workspace/MuseTalk
+    command: ["python", "app.py", "--ip", "0.0.0.0", "--port", "7860"]
+    restart: unless-stopped

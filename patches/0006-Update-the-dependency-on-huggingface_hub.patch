@@ -1,0 +1,39 @@
+From 2ebe3f3095be97652a353ff005b708c0b1148d79 Mon Sep 17 00:00:00 2001
+From: Haihao Xiang <haihao.xiang@intel.com>
+Date: Tue, 2 Dec 2025 09:19:22 +0800
+Subject: [PATCH 6/7] Update the dependency on huggingface_hub
+
+---
+ download_weights.sh | 2 +-
+ requirements.txt    | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/download_weights.sh b/download_weights.sh
+index affa5a9..ce9c169 100644
+--- a/download_weights.sh
++++ b/download_weights.sh
+@@ -7,7 +7,7 @@ CheckpointsDir="models"
+ mkdir -p models/musetalk models/musetalkV15 models/syncnet models/dwpose models/face-parse-bisent models/sd-vae models/whisper
+ 
+ # Install required packages
+-pip install -U "huggingface_hub[cli]"
++# pip install -U "huggingface_hub[cli]"
+ pip install gdown
+ 
+ # Set HuggingFace mirror endpoint
+diff --git a/requirements.txt b/requirements.txt
+index e87aa41..0098f15 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -6,7 +6,7 @@ tensorboard==2.12.0
+ opencv-python==4.9.0.80
+ soundfile==0.12.1
+ transformers==4.39.2
+-huggingface_hub==0.30.2
++huggingface_hub[cli]==0.30.2
+ librosa==0.11.0
+ einops==0.8.1
+ gradio==5.24.0
+-- 
+2.43.0
+

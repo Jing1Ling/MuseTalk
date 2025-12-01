@@ -1,0 +1,283 @@
+From cafa7bb6feaefe60988232b4aa0e7e950dabc94b Mon Sep 17 00:00:00 2001
+From: Jing <jing1.ling@intel.com>
+Date: Fri, 28 Nov 2025 16:55:17 +0800
+Subject: [PATCH 5/7] Optimization
+
+---
+ app.py                          | 103 ++++++++++++++++----------------
+ musetalk/utils/blending.py      |  62 +++++++++++++++++++
+ musetalk/utils/preprocessing.py |   4 +-
+ 3 files changed, 115 insertions(+), 54 deletions(-)
+
+diff --git a/app.py b/app.py
+index d1639ea..109b336 100644
+--- a/app.py
++++ b/app.py
+@@ -20,6 +20,8 @@ from moviepy.editor import VideoFileClip, AudioFileClip
+ from transformers import WhisperModel
+ import gradio as gr
+ 
++from musetalk.utils.blending import get_blending_mask, get_image, get_image_blending, get_image_blending_from_mask_info
++
+ inpainting_infer_ps = None
+ task_queue = None
+ result_queue = None
+@@ -298,12 +300,14 @@ def infer(pe, vae, unet, timesteps, audio_processor, whisper,
+     # Initialize face parser
+     fp = FaceParsing(
+         left_cheek_width=args.left_cheek_width,
+-        right_cheek_width=args.right_cheek_width
++        right_cheek_width=args.right_cheek_width,
++        device="hpu"
+     )
+     
+     i = 0
+     input_latent_list = []
+-    for bbox, frame in zip(coord_list, frame_list):
++    input_blending_mask_info_list = []
++    for bbox, frame in  tqdm(zip(coord_list, frame_list), total=len(coord_list)):
+         if bbox == coord_placeholder:
+             continue
+         x1, y1, x2, y2 = bbox
+@@ -314,20 +318,28 @@ def infer(pe, vae, unet, timesteps, audio_processor, whisper,
+         latents = vae.get_latents_for_unet(crop_frame)
+         input_latent_list.append(latents)
+ 
++        if args.version == "v15":
++            blending_mask, crop_bbox = get_blending_mask(frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
++        else:
++            blending_mask, crop_bbox = get_blending_mask(frame, [x1, y1, x2, y2], fp=fp)
++        input_blending_mask_info_list.append((blending_mask, crop_bbox))
++
+     # to smooth the first and the last frame
+     frame_list_cycle = frame_list + frame_list[::-1]
+     coord_list_cycle = coord_list + coord_list[::-1]
+     input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
++    input_blending_mask_info_list = input_blending_mask_info_list + input_blending_mask_info_list[::-1]
+     
+     ############################################## inference batch by batch ##############################################
+     print("start inference")
+     video_num = len(whisper_chunks)
+     batch_size = args.batch_size
++    delay_frame = 0
+     gen = datagen(
+         whisper_chunks=whisper_chunks,
+         vae_encode_latents=input_latent_list_cycle,
+         batch_size=batch_size,
+-        delay_frame=0,
++        delay_frame=delay_frame,
+         device=device,
+     )
+     res_frame_list = []
+@@ -342,10 +354,30 @@ def infer(pe, vae, unet, timesteps, audio_processor, whisper,
+             res_frame_list.append(res_frame)
+             
+     ############################################## pad to full image ##############################################
++    height, width, _ = frame_list[0].shape
++    temp_vid_path = 'temp.mp4'
++    ffmpeg_cmd = [
++        "ffmpeg", "-y",
++        "-f", "rawvideo",
++        "-vcodec", "rawvideo",
++        "-pix_fmt", "rgb24",
++        "-s", f"{width}x{height}",
++        "-r", str(fps),
++        "-i", "-",                    # stdin 输入
++        "-an",
++        "-vcodec", "libx264",
++        "-preset", "fast",
++        "-pix_fmt", "yuv420p",
++        "-crf", "18",
++        temp_vid_path
++    ]
++    process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
++
+     print("pad talking image to original video")
+     for i, res_frame in enumerate(tqdm(res_frame_list)):
+-        bbox = coord_list_cycle[i%(len(coord_list_cycle))]
+-        ori_frame = copy.deepcopy(frame_list_cycle[i%(len(frame_list_cycle))])
++        bbox = coord_list_cycle[(i+delay_frame)%(len(coord_list_cycle))]
++        ori_frame = copy.deepcopy(frame_list_cycle[(i+delay_frame)%(len(frame_list_cycle))])
++        blending_mask, crop_bbox = input_blending_mask_info_list[(i+delay_frame)%(len(coord_list_cycle))]
+         x1, y1, x2, y2 = bbox
+         y2 = y2 + args.extra_margin
+         y2 = min(y2, frame.shape[0])
+@@ -353,33 +385,17 @@ def infer(pe, vae, unet, timesteps, audio_processor, whisper,
+             res_frame = cv2.resize(res_frame.astype(np.uint8),(x2-x1,y2-y1))
+         except:
+             continue
+-        
++
+         # Use v15 version blending
+-        combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+-            
+-        cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png",combine_frame)
+-        
+-    # Frame rate
+-    fps = 25
+-    # Output video path
+-    output_video = 'temp.mp4'
+-
+-    # Read images
+-    def is_valid_image(file):
+-        pattern = re.compile(r'\d{8}\.png')
+-        return pattern.match(file)
+-
+-    images = []
+-    files = [file for file in os.listdir(result_img_save_path) if is_valid_image(file)]
+-    files.sort(key=lambda x: int(x.split('.')[0]))
+-
+-    for file in files:
+-        filename = os.path.join(result_img_save_path, file)
+-        images.append(imageio.imread(filename))
+-        
++        combine_frame = get_image_blending_from_mask_info(ori_frame, res_frame, [x1, y1, x2, y2], blending_mask, crop_bbox)
+ 
+-    # Save video
+-    imageio.mimwrite(output_video, images, 'FFMPEG', fps=fps, codec='libx264', pixelformat='yuv420p')
++        # combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
++        process.stdin.write(combine_frame.astype(np.uint8).tobytes())
++        # cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png",combine_frame)
++
++    process.stdin.close()
++    process.wait()
++    print("Video saved to", temp_vid_path)
+ 
+     input_video = './temp.mp4'
+     # Check if the input_video and audio_path exist
+@@ -387,32 +403,15 @@ def infer(pe, vae, unet, timesteps, audio_processor, whisper,
+         raise FileNotFoundError(f"Input video file not found: {input_video}")
+     if not os.path.exists(audio_path):
+         raise FileNotFoundError(f"Audio file not found: {audio_path}")
+-    
+-    # Read video
+-    reader = imageio.get_reader(input_video)
+-    fps = reader.get_meta_data()['fps']  # Get original video frame rate
+-    reader.close() # Otherwise, error on win11: PermissionError: [WinError 32] Another program is using this file, process cannot access. : 'temp.mp4'
+-    # Store frames in list
+-    frames = images
+-    
+-    print(len(frames))
+-
+-    # Load the video
+-    video_clip = VideoFileClip(input_video)
+-
+-    # Load the audio
+-    audio_clip = AudioFileClip(audio_path)
+-
+-    # Set the audio to the video
+-    video_clip = video_clip.set_audio(audio_clip)
+ 
+-    # Write the output video
+-    video_clip.write_videofile(output_vid_name, codec='libx264', audio_codec='aac',fps=25)
++    cmd_combine_audio = f"ffmpeg -y -v warning -i {audio_path} -i {temp_vid_path} {output_vid_name}"
++    print("Audio combination command:", cmd_combine_audio) 
++    os.system(cmd_combine_audio)
+ 
+     os.remove("temp.mp4")
+-    #shutil.rmtree(result_img_save_path)
++    # shutil.rmtree(result_img_save_path)
+     print(f"result is save to {output_vid_name}")
+-    return output_vid_name,bbox_shift_text
++    return output_vid_name, bbox_shift_text
+ 
+ @torch.no_grad()
+ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode="jaw",
+diff --git a/musetalk/utils/blending.py b/musetalk/utils/blending.py
+index fa3effc..df74ffc 100755
+--- a/musetalk/utils/blending.py
++++ b/musetalk/utils/blending.py
+@@ -93,6 +93,68 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
+     return body[:, :, ::-1]  # 返回处理后的图像（BGR 转 RGB）
+ 
+ 
++def get_blending_mask(image, face_box, upper_boundary_ratio=0.5, expand=1.5, mode="raw", fp=None):
++    # 将 numpy 数组转换为 PIL 图像
++    body = Image.fromarray(image[:, :, ::-1])  # 身体部分图像(整张图)
++
++    x, y, x1, y1 = face_box  # 获取面部边界框的坐标
++    crop_box, s = get_crop_box(face_box, expand)  # 计算扩展后的裁剪框
++    x_s, y_s, x_e, y_e = crop_box  # 裁剪框的坐标
++    face_position = (x, y)  # 面部在原始图像中的位置
++
++    # 从身体图像中裁剪出扩展后的面部区域（下巴到边界有距离）
++    face_large = body.crop(crop_box)
++        
++    ori_shape = face_large.size  # 裁剪后图像的原始尺寸
++
++    # 对裁剪后的面部区域进行面部解析，生成掩码
++    mask_image = face_seg(face_large, mode=mode, fp=fp)
++    
++    mask_small = mask_image.crop((x - x_s, y - y_s, x1 - x_s, y1 - y_s))  # 裁剪出面部区域的掩码
++    
++    mask_image = Image.new('L', ori_shape, 0)  # 创建一个全黑的掩码图像
++    mask_image.paste(mask_small, (x - x_s, y - y_s, x1 - x_s, y1 - y_s))  # 将面部掩码粘贴到全黑图像上
++    
++    
++    # 保留面部区域的上半部分（用于控制说话区域）
++    width, height = mask_image.size
++    top_boundary = int(height * upper_boundary_ratio)  # 计算上半部分的边界
++    modified_mask_image = Image.new('L', ori_shape, 0)  # 创建一个新的全黑掩码图像
++    modified_mask_image.paste(mask_image.crop((0, top_boundary, width, height)), (0, top_boundary))  # 粘贴上半部分掩码
++    
++    
++    # 对掩码进行高斯模糊，使边缘更平滑
++    blur_kernel_size = int(0.05 * ori_shape[0] // 2 * 2) + 1  # 计算模糊核大小
++    mask_array = cv2.GaussianBlur(np.array(modified_mask_image), (blur_kernel_size, blur_kernel_size), 0)  # 高斯模糊
++    #mask_array = np.array(modified_mask_image)
++    mask_image = Image.fromarray(mask_array)  # 将模糊后的掩码转换回 PIL 图像
++    return mask_image, crop_box
++    # # 将裁剪的面部图像粘贴回扩展后的面部区域
++    # face_large.paste(face, (x - x_s, y - y_s, x1 - x_s, y1 - y_s))
++    
++    # body.paste(face_large, crop_box[:2], mask_image)
++    
++    # body = np.array(body)  # 将 PIL 图像转换回 numpy 数组
++
++    # return body[:, :, ::-1]  # 返回处理后的图像（BGR 转 RGB）
++def get_image_blending_from_mask_info(image, face, face_box, mask_image, crop_box):
++    body = Image.fromarray(image[:,:,::-1])
++    face = Image.fromarray(face[:,:,::-1])
++
++    x, y, x1, y1 = face_box
++    x_s, y_s, x_e, y_e = crop_box
++    face_large = body.crop(crop_box)
++    # print(face_large.size)
++    # print(mask_image.size)
++    # print(crop_box)
++    # print(face.size)
++    # print(face_box)
++    face_large.paste(face, (x-x_s, y-y_s, x1-x_s, y1-y_s))
++    body.paste(face_large, crop_box[:2], mask_image)
++    body = np.array(body)
++    return body #[:,:,::-1]
++
++
+ def get_image_blending(image, face, face_box, mask_array, crop_box):
+     body = Image.fromarray(image[:,:,::-1])
+     face = Image.fromarray(face[:,:,::-1])
+diff --git a/musetalk/utils/preprocessing.py b/musetalk/utils/preprocessing.py
+index 655afa1..1811c17 100755
+--- a/musetalk/utils/preprocessing.py
++++ b/musetalk/utils/preprocessing.py
+@@ -41,7 +41,7 @@ def read_imgs(img_list):
+ 
+ def get_bbox_range(img_list,upperbondrange =0):
+     frames = read_imgs(img_list)
+-    batch_size_fa = 1
++    batch_size_fa = 8
+     batches = [frames[i:i + batch_size_fa] for i in range(0, len(frames), batch_size_fa)]
+     coords_list = []
+     landmarks = []
+@@ -82,7 +82,7 @@ def get_bbox_range(img_list,upperbondrange =0):
+ 
+ def get_landmark_and_bbox(img_list,upperbondrange =0):
+     frames = read_imgs(img_list)
+-    batch_size_fa = 1
++    batch_size_fa = 8
+     batches = [frames[i:i + batch_size_fa] for i in range(0, len(frames), batch_size_fa)]
+     coords_list = []
+     landmarks = []
+-- 
+2.43.0
+

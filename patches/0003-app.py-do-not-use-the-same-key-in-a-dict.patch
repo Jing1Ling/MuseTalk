@@ -1,0 +1,27 @@
+From 6a52769d1b4545a013637eb09e51b05805e2c171 Mon Sep 17 00:00:00 2001
+From: Haihao Xiang <haihao.xiang@intel.com>
+Date: Wed, 26 Nov 2025 16:23:39 +0800
+Subject: [PATCH 3/7] app.py: do not use the same key in a dict
+
+---
+ app.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/app.py b/app.py
+index 7807c11..a826dbc 100644
+--- a/app.py
++++ b/app.py
+@@ -160,8 +160,8 @@ def print_directory_contents(path):
+ def download_model():
+     # 检查必需的模型文件是否存在
+     required_models = {
+-        "MuseTalk": f"{CheckpointsDir}/musetalkV15/unet.pth",
+-        "MuseTalk": f"{CheckpointsDir}/musetalkV15/musetalk.json",
++        "MuseTalk UNet": f"{CheckpointsDir}/musetalkV15/unet.pth",
++        "MuseTalk Config": f"{CheckpointsDir}/musetalkV15/musetalk.json",
+         "SD VAE": f"{CheckpointsDir}/sd-vae/config.json",
+         "Whisper": f"{CheckpointsDir}/whisper/config.json",
+         "DWPose": f"{CheckpointsDir}/dwpose/dw-ll_ucoco_384.pth",
+-- 
+2.43.0
+

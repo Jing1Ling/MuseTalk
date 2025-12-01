@@ -1,0 +1,552 @@
+From 510a837a5ad5c076e7b0075e8b5da071f90e4352 Mon Sep 17 00:00:00 2001
+From: Haihao Xiang <haihao.xiang@intel.com>
+Date: Fri, 21 Nov 2025 10:44:44 +0800
+Subject: [PATCH 2/7] app.py: Add a workaround
+
+The patch uses the main process to handle gradio operations and the
+child process to handle all HPU operations
+
+This workarounds the issue below:
+[...]
+Synapse detected a device critical error that requires a restart. Killing process in 5 seconds (hl: 3) 06:28:41 [please check log files for dfa cause]
+Killed
+---
+ app.py | 468 +++++++++++++++++++++++++++++++++++++--------------------
+ 1 file changed, 305 insertions(+), 163 deletions(-)
+
+diff --git a/app.py b/app.py
+index 98657c8..7807c11 100644
+--- a/app.py
++++ b/app.py
+@@ -1,40 +1,43 @@
+ import os
+ import time
+-import pdb
+ import re
+-
+-import gradio as gr
+-import numpy as np
+ import sys
+ import subprocess
+-
+-from huggingface_hub import snapshot_download
+-import requests
+-
++import multiprocessing
+ import argparse
+-import os
+-from omegaconf import OmegaConf
+-import numpy as np
+-import cv2
+-import torch
+ import glob
+ import pickle
+-from tqdm import tqdm
+ import copy
++
++import cv2
++import torch
++import numpy as np
++import imageio
++from tqdm import tqdm
+ from argparse import Namespace
+ import shutil
+-import gdown
+-import imageio
+-import ffmpeg
+-from moviepy.editor import *
++from moviepy.editor import VideoFileClip, AudioFileClip
+ from transformers import WhisperModel
++import gradio as gr
++
++inpainting_infer_ps = None
++task_queue = None
++result_queue = None
++task_event = None
++shutdown_event = None
+ 
+ ProjectDir = os.path.abspath(os.path.dirname(__file__))
+ CheckpointsDir = os.path.join(ProjectDir, "models")
+ 
+-@torch.no_grad()
+-def debug_inpainting(video_path, bbox_shift, extra_margin=10, parsing_mode="jaw", 
+-                    left_cheek_width=90, right_cheek_width=90):
++def inpainting(pe, vae, unet, timesteps,
++               video_path, bbox_shift, extra_margin, parsing_mode,
++               left_cheek_width, right_cheek_width,
++               device, weight_dtype):
++    from musetalk.utils.blending import get_image
++    from musetalk.utils.face_parsing import FaceParsing
++    from musetalk.utils.utils import get_file_type
++    from musetalk.utils.preprocessing import get_landmark_and_bbox, coord_placeholder
++
+     """Debug inpainting parameters, only process the first frame"""
+     # Set default parameters
+     args_dict = {
+@@ -119,8 +122,34 @@ def debug_inpainting(video_path, bbox_shift, extra_margin=10, parsing_mode="jaw"
+                 f"left_cheek_width: {left_cheek_width}\n" + \
+                 f"right_cheek_width: {right_cheek_width}\n" + \
+                 f"Detected face coordinates: [{x1}, {y1}, {x2}, {y2}]"
+-    
+-    return cv2.cvtColor(combine_frame, cv2.COLOR_RGB2BGR), info_text
++
++    return combine_frame, info_text
++
++@torch.no_grad()
++def debug_inpainting(video_path, bbox_shift, extra_margin=10, parsing_mode="jaw",
++                    left_cheek_width=90, right_cheek_width=90):
++    global task_queue, result_queue, task_event
++
++    task = {
++        'is_testing': True,
++        'video_path': video_path,
++        'bbox_shift': bbox_shift,
++        'extra_margin': extra_margin,
++        'parsing_mode': parsing_mode,
++        'left_cheek_width': left_cheek_width,
++        'right_cheek_width': right_cheek_width,
++    }
++    task_queue.put(task)
++    # Signal child process immediately after enqueuing the task
++    task_event.set()
++
++    try:
++        result = result_queue.get(timeout=None)
++        return cv2.cvtColor(result['frame'], cv2.COLOR_RGB2BGR), result['info_text']
++
++    except Exception:
++        print("Fatal error!!!")
++        return None, None
+ 
+ def print_directory_contents(path):
+     for child in os.listdir(path):
+@@ -165,12 +194,6 @@ def download_model():
+ 
+ download_model()  # for huggingface deployment.
+ 
+-from musetalk.utils.blending import get_image
+-from musetalk.utils.face_parsing import FaceParsing
+-from musetalk.utils.audio_processor import AudioProcessor
+-from musetalk.utils.utils import get_file_type, get_video_fps, datagen, load_all_model
+-from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder, get_bbox_range
+-
+ 
+ def fast_check_ffmpeg():
+     try:
+@@ -179,10 +202,16 @@ def fast_check_ffmpeg():
+     except:
+         return False
+ 
++def infer(pe, vae, unet, timesteps, audio_processor, whisper,
++          audio_path, video_path, bbox_shift, extra_margin, parsing_mode,
++          left_cheek_width, right_cheek_width, progress,
++          device, weight_dtype):
++    from musetalk.utils.blending import get_image
++    from musetalk.utils.face_parsing import FaceParsing
++    from musetalk.utils.audio_processor import AudioProcessor
++    from musetalk.utils.utils import get_file_type, get_video_fps, datagen
++    from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder, get_bbox_range
+ 
+-@torch.no_grad()
+-def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode="jaw", 
+-              left_cheek_width=90, right_cheek_width=90, progress=gr.Progress(track_tqdm=True)):
+     # Set default parameters, aligned with inference.py
+     args_dict = {
+         "result_dir": './results/output', 
+@@ -385,48 +414,32 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
+     print(f"result is save to {output_vid_name}")
+     return output_vid_name,bbox_shift_text
+ 
++@torch.no_grad()
++def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode="jaw",
++              left_cheek_width=90, right_cheek_width=90, progress=gr.Progress(track_tqdm=True)):
++    global task_queue, result_queue, task_event
++
++    task = {
++        'is_testing': False,
++        'audio_path': audio_path,
++        'video_path': video_path,
++        'bbox_shift': bbox_shift,
++        'extra_margin': extra_margin,
++        'parsing_mode': parsing_mode,
++        'left_cheek_width': left_cheek_width,
++        'right_cheek_width': right_cheek_width,
++        'progress': progress
++    }
++    task_queue.put(task)
++    # Signal child process immediately after enqueuing the task
++    task_event.set()
+ 
+-
+-# load model weights
+-device = "hpu"
+-vae, unet, pe = load_all_model(
+-    unet_model_path="./models/musetalkV15/unet.pth", 
+-    vae_type="sd-vae",
+-    unet_config="./models/musetalkV15/musetalk.json",
+-    device=device
+-)
+-
+-# Parse command line arguments
+-parser = argparse.ArgumentParser()
+-parser.add_argument("--ffmpeg_path", type=str, default=r"ffmpeg-master-latest-win64-gpl-shared\bin", help="Path to ffmpeg executable")
+-parser.add_argument("--ip", type=str, default="127.0.0.1", help="IP address to bind to")
+-parser.add_argument("--port", type=int, default=7860, help="Port to bind to")
+-parser.add_argument("--share", action="store_true", help="Create a public link")
+-parser.add_argument("--use_float16", action="store_true", help="Use float16 for faster inference")
+-args = parser.parse_args()
+-
+-# Set data type
+-if args.use_float16:
+-    # Convert models to half precision for better performance
+-    pe = pe.half()
+-    vae.vae = vae.vae.half()
+-    unet.model = unet.model.half()
+-    weight_dtype = torch.float16
+-else:
+-    weight_dtype = torch.float32
+-
+-# Move models to specified device
+-pe = pe.to(device)
+-vae.vae = vae.vae.to(device)
+-unet.model = unet.model.to(device)
+-
+-timesteps = torch.tensor([0], device=device)
+-
+-# Initialize audio processor and Whisper model
+-audio_processor = AudioProcessor(feature_extractor_path="./models/whisper")
+-whisper = WhisperModel.from_pretrained("./models/whisper")
+-whisper = whisper.to(device=device, dtype=weight_dtype).eval()
+-whisper.requires_grad_(False)
++    try:
++        result = result_queue.get(timeout=None)
++        return result['output_vid_name'], result['bbox_shift_text']
++    except Exception:
++        print("Fatal error!!!")
++        return None, None
+ 
+ 
+ def check_video(video):
+@@ -471,100 +484,229 @@ def check_video(video):
+     imageio.mimwrite(output_video, target_frames, 'FFMPEG', fps=25, codec='libx264', quality=9, pixelformat='yuv420p')
+     return output_video
+ 
++def inpainting_infer_ps_fn(use_float16: bool,
++                           task_queue: multiprocessing.Queue,
++                           result_queue: multiprocessing.Queue,
++                           task_event,
++                           shutdown_event):
++    from musetalk.utils.utils import load_all_model
++    from musetalk.utils.audio_processor import AudioProcessor
++
++    # load model weights
++    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    device = "hpu"
++    vae, unet, pe = load_all_model(
++        unet_model_path="./models/musetalkV15/unet.pth",
++        vae_type="sd-vae",
++        unet_config="./models/musetalkV15/musetalk.json",
++        device=device
++    )
+ 
++    # Set data type
++    if use_float16:
++        # Convert models to half precision for better performance
++        pe = pe.half()
++        vae.vae = vae.vae.half()
++        unet.model = unet.model.half()
++        weight_dtype = torch.float16
++    else:
++        weight_dtype = torch.float32
++
++    # Move models to specified device
++    pe = pe.to(device)
++    vae.vae = vae.vae.to(device)
++    unet.model = unet.model.to(device)
++
++    timesteps = torch.tensor([0], device=device)
++
++    # Initialize audio processor and Whisper model
++    audio_processor = AudioProcessor(feature_extractor_path="./models/whisper")
++    whisper = WhisperModel.from_pretrained("./models/whisper")
++    whisper = whisper.to(device=device, dtype=weight_dtype).eval()
++    whisper.requires_grad_(False)
++
++    print("Starting the main loop in the child process")
++    while not shutdown_event.is_set():
++        task_event.wait(timeout=2)
++
++        if shutdown_event.is_set():
++            break
++        # Clear the event before draining the queue to avoid losing a set() that
++        # happens while we are processing tasks.
++        task_event.clear()
++
++        # Drain all available tasks.
++        while True:
++            try:
++                task = task_queue.get_nowait()
++            except Exception:
++                break
++            if task is None:
++                print("Got an empty task in the loop !!!")
++                continue
++
++            is_testing = task['is_testing']
++            if is_testing:
++                video_path = task['video_path']
++                bbox_shift = task['bbox_shift']
++                extra_margin = task['extra_margin']
++                parsing_mode = task['parsing_mode']
++                left_cheek_width = task['left_cheek_width']
++                right_cheek_width = task['right_cheek_width']
++
++                frame, info_text = inpainting(pe, vae, unet, timesteps,
++                                              video_path, bbox_shift, extra_margin, parsing_mode,
++                                              left_cheek_width, right_cheek_width,
++                                              device, weight_dtype)
++                result = {
++                    'frame': frame,
++                    'info_text': info_text,
++                }
++            else:
++                audio_path = task['audio_path']
++                video_path = task['video_path']
++                bbox_shift = task['bbox_shift']
++                extra_margin = task['extra_margin']
++                parsing_mode = task['parsing_mode']
++                left_cheek_width = task['left_cheek_width']
++                right_cheek_width = task['right_cheek_width']
++                progress = task['progress']
++                output_vid_name, bbox_shift_text = infer(pe, vae, unet, timesteps, audio_processor, whisper,
++                                                         audio_path, video_path, bbox_shift,
++                                                         extra_margin, parsing_mode,
++                                                         left_cheek_width, right_cheek_width, progress,
++                                                         device, weight_dtype)
++                result = {
++                    'output_vid_name': output_vid_name,
++                    'bbox_shift_text': bbox_shift_text,
++                }
++
++            result_queue.put(result)
+ 
+ 
+-css = """#input_img {max-width: 1024px !important} #output_vid {max-width: 1024px; max-height: 576px}"""
+-
+-with gr.Blocks(css=css) as demo:
+-    gr.Markdown(
+-        """<div align='center'> <h1>MuseTalk: Real-Time High-Fidelity Video Dubbing via Spatio-Temporal Sampling</h1> \
+-                    <h2 style='font-weight: 450; font-size: 1rem; margin: 0rem'>\
+-                    </br>\
+-                    Yue Zhang <sup>*</sup>,\
+-                    Zhizhou Zhong <sup>*</sup>,\
+-                    Minhao Liu<sup>*</sup>,\
+-                    Zhaokang Chen,\
+-                    Bin Wu<sup>†</sup>,\
+-                    Yubin Zeng,\
+-                    Chao Zhang,\
+-                    Yingjie He,\
+-                    Junxin Huang,\
+-                    Wenjiang Zhou <br>\
+-                    (<sup>*</sup>Equal Contribution, <sup>†</sup>Corresponding Author, benbinwu@tencent.com)\
+-                    Lyra Lab, Tencent Music Entertainment\
+-                </h2> \
+-                <a style='font-size:18px;color: #000000' href='https://github.com/TMElyralab/MuseTalk'>[Github Repo]</a>\
+-                <a style='font-size:18px;color: #000000' href='https://github.com/TMElyralab/MuseTalk'>[Huggingface]</a>\
+-                <a style='font-size:18px;color: #000000' href='https://arxiv.org/abs/2410.10122'> [Technical report] </a>"""
+-    )
+-
+-    with gr.Row():
+-        with gr.Column():
+-            audio = gr.Audio(label="Drving Audio",type="filepath")
+-            video = gr.Video(label="Reference Video",sources=['upload'])
+-            bbox_shift = gr.Number(label="BBox_shift value, px", value=0)
+-            extra_margin = gr.Slider(label="Extra Margin", minimum=0, maximum=40, value=10, step=1)
+-            parsing_mode = gr.Radio(label="Parsing Mode", choices=["jaw", "raw"], value="jaw")
+-            left_cheek_width = gr.Slider(label="Left Cheek Width", minimum=20, maximum=160, value=90, step=5)
+-            right_cheek_width = gr.Slider(label="Right Cheek Width", minimum=20, maximum=160, value=90, step=5)
+-            bbox_shift_scale = gr.Textbox(label="'left_cheek_width' and 'right_cheek_width' parameters determine the range of left and right cheeks editing when parsing model is 'jaw'. The 'extra_margin' parameter determines the movement range of the jaw. Users can freely adjust these three parameters to obtain better inpainting results.")
+-
+-            with gr.Row():
+-                debug_btn = gr.Button("1. Test Inpainting ")
+-                btn = gr.Button("2. Generate")
+-        with gr.Column():
+-            debug_image = gr.Image(label="Test Inpainting Result (First Frame)")
+-            debug_info = gr.Textbox(label="Parameter Information", lines=5)
+-            out1 = gr.Video()
+-    
+-    video.change(
+-        fn=check_video, inputs=[video], outputs=[video]
+-    )
+-    btn.click(
+-        fn=inference,
+-        inputs=[
+-            audio,
+-            video,
+-            bbox_shift,
+-            extra_margin,
+-            parsing_mode,
+-            left_cheek_width,
+-            right_cheek_width
+-        ],
+-        outputs=[out1,bbox_shift_scale]
+-    )
+-    debug_btn.click(
+-        fn=debug_inpainting,
+-        inputs=[
+-            video,
+-            bbox_shift,
+-            extra_margin,
+-            parsing_mode,
+-            left_cheek_width,
+-            right_cheek_width
+-        ],
+-        outputs=[debug_image, debug_info]
++# Parse command line arguments
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--ffmpeg_path", type=str, default=r"ffmpeg-master-latest-win64-gpl-shared\\bin", help="Path to ffmpeg executable")
++    parser.add_argument("--ip", type=str, default="127.0.0.1", help="IP address to bind to")
++    parser.add_argument("--port", type=int, default=7860, help="Port to bind to")
++    parser.add_argument("--share", action="store_true", help="Create a public link")
++    parser.add_argument("--use_float16", action="store_true", help="Use float16 for faster inference")
++    args = parser.parse_args()
++
++    global task_queue, result_queue, task_event, shutdown_event, inpainting_infer_ps
++    task_queue = multiprocessing.Queue(maxsize=3)
++    result_queue = multiprocessing.Queue(maxsize=3)
++    task_event = multiprocessing.Event()
++    shutdown_event = multiprocessing.Event()
++
++    inpainting_infer_ps = multiprocessing.Process(
++        target=inpainting_infer_ps_fn,
++        args=(args.use_float16, task_queue, result_queue, task_event, shutdown_event),
+     )
++    inpainting_infer_ps.start()
++
++    time.sleep(5)
++
++    css = """#input_img {max-width: 1024px !important} #output_vid {max-width: 1024px; max-height: 576px}"""
++
++    with gr.Blocks(css=css) as demo:
++        gr.Markdown(
++            """<div align='center'> <h1>MuseTalk: Real-Time High-Fidelity Video Dubbing via Spatio-Temporal Sampling</h1> \
++                        <h2 style='font-weight: 450; font-size: 1rem; margin: 0rem'>\
++                        </br>\
++                        Yue Zhang <sup>*</sup>,\
++                        Zhizhou Zhong <sup>*</sup>,\
++                        Minhao Liu<sup>*</sup>,\
++                        Zhaokang Chen,\
++                        Bin Wu<sup>†</sup>,\
++                        Yubin Zeng,\
++                        Chao Zhang,\
++                        Yingjie He,\
++                        Junxin Huang,\
++                        Wenjiang Zhou <br>\
++                        (<sup>*</sup>Equal Contribution, <sup>†</sup>Corresponding Author, benbinwu@tencent.com)\
++                        Lyra Lab, Tencent Music Entertainment\
++                    </h2> \
++                    <a style='font-size:18px;color: #000000' href='https://github.com/TMElyralab/MuseTalk'>[Github Repo]</a>\
++                    <a style='font-size:18px;color: #000000' href='https://github.com/TMElyralab/MuseTalk'>[Huggingface]</a>\
++                    <a style='font-size:18px;color: #000000' href='https://arxiv.org/abs/2410.10122'> [Technical report] </a>"""
++        )
++
++        with gr.Row():
++            with gr.Column():
++                audio = gr.Audio(label="Drving Audio", type="filepath")
++                video = gr.Video(label="Reference Video", sources=['upload'])
++                bbox_shift = gr.Number(label="BBox_shift value, px", value=0)
++                extra_margin = gr.Slider(label="Extra Margin", minimum=0, maximum=40, value=10, step=1)
++                parsing_mode = gr.Radio(label="Parsing Mode", choices=["jaw", "raw"], value="jaw")
++                left_cheek_width = gr.Slider(label="Left Cheek Width", minimum=20, maximum=160, value=90, step=5)
++                right_cheek_width = gr.Slider(label="Right Cheek Width", minimum=20, maximum=160, value=90, step=5)
++                bbox_shift_scale = gr.Textbox(label="'left_cheek_width' and 'right_cheek_width' parameters determine the range of left and right cheeks editing when parsing model is 'jaw'. The 'extra_margin' parameter determines the movement range of the jaw. Users can freely adjust these three parameters to obtain better inpainting results.")
++
++                with gr.Row():
++                    debug_btn = gr.Button("1. Test Inpainting ")
++                    btn = gr.Button("2. Generate")
++            with gr.Column():
++                debug_image = gr.Image(label="Test Inpainting Result (First Frame)")
++                debug_info = gr.Textbox(label="Parameter Information", lines=5)
++                out1 = gr.Video()
++
++        video.change(
++            fn=check_video, inputs=[video], outputs=[video]
++        )
++        btn.click(
++            fn=inference,
++            inputs=[
++                audio,
++                video,
++                bbox_shift,
++                extra_margin,
++                parsing_mode,
++                left_cheek_width,
++                right_cheek_width
++            ],
++            outputs=[out1, bbox_shift_scale]
++        )
++        debug_btn.click(
++            fn=debug_inpainting,
++            inputs=[
++                video,
++                bbox_shift,
++                extra_margin,
++                parsing_mode,
++                left_cheek_width,
++                right_cheek_width
++            ],
++            outputs=[debug_image, debug_info]
++        )
+ 
+-# Check ffmpeg and add to PATH
+-if not fast_check_ffmpeg():
+-    print(f"Adding ffmpeg to PATH: {args.ffmpeg_path}")
+-    # According to operating system, choose path separator
+-    path_separator = ';' if sys.platform == 'win32' else ':'
+-    os.environ["PATH"] = f"{args.ffmpeg_path}{path_separator}{os.environ['PATH']}"
+     if not fast_check_ffmpeg():
+-        print("Warning: Unable to find ffmpeg, please ensure ffmpeg is properly installed")
++        print(f"Adding ffmpeg to PATH: {args.ffmpeg_path}")
++        path_separator = ';' if sys.platform == 'win32' else ':'
++        os.environ["PATH"] = f"{args.ffmpeg_path}{path_separator}{os.environ['PATH']}"
++        if not fast_check_ffmpeg():
++            print("Warning: Unable to find ffmpeg, please ensure ffmpeg is properly installed")
++
++    if sys.platform == 'win32':
++        import asyncio
++        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+ 
+-# Solve asynchronous IO issues on Windows
+-if sys.platform == 'win32':
+-    import asyncio
+-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+-
+-# Start Gradio application
+-demo.queue().launch(
+-    share=args.share, 
+-    debug=True, 
+-    server_name=args.ip, 
+-    server_port=args.port
+-)
++    try:
++        demo.queue(max_size=8 * 4, default_concurrency_limit=1).launch(
++            share=args.share,
++            debug=True,
++            server_name=args.ip,
++            server_port=args.port)
++    except KeyboardInterrupt:
++        print("Main process received KeyboardInterrupt")
++    finally:
++        if inpainting_infer_ps and shutdown_event:
++            shutdown_event.set()
++            inpainting_infer_ps.join(timeout=5)
++            if inpainting_infer_ps.is_alive():
++                inpainting_infer_ps.terminate()
++                inpainting_infer_ps.join()
++
++if __name__ == "__main__":
++    main()
+-- 
+2.43.0
+
