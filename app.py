@@ -308,21 +308,19 @@ def infer(pe, vae, unet, timesteps, audio_processor, whisper,
     input_latent_list = []
     input_blending_mask_info_list = []
     for bbox, frame in  tqdm(zip(coord_list, frame_list), total=len(coord_list)):
-        if bbox == coord_placeholder:
-            continue
         x1, y1, x2, y2 = bbox
         y2 = y2 + args.extra_margin
         y2 = min(y2, frame.shape[0])
+        # use v15 blending
+        blending_mask, crop_bbox = get_blending_mask(frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+        input_blending_mask_info_list.append((blending_mask, crop_bbox))
+        if bbox == coord_placeholder:
+            continue
         crop_frame = frame[y1:y2, x1:x2]
         crop_frame = cv2.resize(crop_frame,(256,256),interpolation = cv2.INTER_LANCZOS4)
         latents = vae.get_latents_for_unet(crop_frame)
         input_latent_list.append(latents)
 
-        if args.version == "v15":
-            blending_mask, crop_bbox = get_blending_mask(frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
-        else:
-            blending_mask, crop_bbox = get_blending_mask(frame, [x1, y1, x2, y2], fp=fp)
-        input_blending_mask_info_list.append((blending_mask, crop_bbox))
 
     # to smooth the first and the last frame
     frame_list_cycle = frame_list + frame_list[::-1]
