@@ -22,7 +22,7 @@ model = init_model(config_file, checkpoint_file, device=device)
 fa = FaceAlignment(LandmarksType._2D, flip_input=False,device=device)
 
 # maker if the bbox is not sufficient 
-coord_placeholder = (0.0,0.0,0.0,0.0)
+coord_placeholder = (0, 0, 0, 0)
 
 def resize_landmark(landmark, w, h, new_w, new_h):
     w_ratio = new_w / w
@@ -75,8 +75,10 @@ def get_bbox_range(img_list,upperbondrange =0):
             average_range_plus.append(range_plus)
             if upperbondrange != 0:
                 half_face_coord[1] = upperbondrange+half_face_coord[1] #手动调整  + 向下（偏29）  - 向上（偏28）
-
-    text_range=f"Total frame:「{len(frames)}」 Manually adjust range : [ -{int(sum(average_range_minus) / len(average_range_minus))}~{int(sum(average_range_plus) / len(average_range_plus))} ] , the current value: {upperbondrange}"
+    if len(average_range_minus) != 0 and len(average_range_plus)!=0:
+        text_range=f"Total frame:「{len(frames)}」 Manually adjust range : [ -{int(sum(average_range_minus) / len(average_range_minus))}~{int(sum(average_range_plus) / len(average_range_plus))} ] , the current value: {upperbondrange}"
+    else:
+        text_range = "[warning] no face detected"
     return text_range
     
 
@@ -129,10 +131,12 @@ def get_landmark_and_bbox(img_list,upperbondrange =0):
                 print("error bbox:",f)
             else:
                 coords_list += [f_landmark]
-    
-    print("********************************************bbox_shift parameter adjustment**********************************************************")
-    print(f"Total frame:「{len(frames)}」 Manually adjust range : [ -{int(sum(average_range_minus) / len(average_range_minus))}~{int(sum(average_range_plus) / len(average_range_plus))} ] , the current value: {upperbondrange}")
-    print("*************************************************************************************************************************************")
+    if len(average_range_minus) != 0 and len(average_range_plus)!=0:
+        print("********************************************bbox_shift parameter adjustment**********************************************************")
+        print(f"Total frame:「{len(frames)}」 Manually adjust range : [ -{int(sum(average_range_minus) / len(average_range_minus))}~{int(sum(average_range_plus) / len(average_range_plus))} ] , the current value: {upperbondrange}")
+        print("*************************************************************************************************************************************")
+    else:
+        print("[warning] no face detected")
     return coords_list,frames
     
 

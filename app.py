@@ -147,7 +147,10 @@ def debug_inpainting(video_path, bbox_shift, extra_margin=10, parsing_mode="jaw"
 
     try:
         result = result_queue.get(timeout=None)
-        return cv2.cvtColor(result['frame'], cv2.COLOR_RGB2BGR), result['info_text']
+        if result['frame'] is None:
+            return None, result['info_text']
+        else:
+            return cv2.cvtColor(result['frame'], cv2.COLOR_RGB2BGR), result['info_text']
 
     except Exception:
         print("Fatal error!!!")
