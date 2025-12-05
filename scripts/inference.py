@@ -6,6 +6,7 @@ import torch
 import glob
 import shutil
 import pickle
+import ffmpeg
 import argparse
 import numpy as np
 import subprocess
@@ -13,8 +14,9 @@ from tqdm import tqdm
 from omegaconf import OmegaConf
 from transformers import WhisperModel
 import sys
-
-from musetalk.utils.blending import get_image
+import cProfile
+import pstats
+from musetalk.utils.blending import get_blending_mask, get_image, get_image_blending, get_image_blending_from_mask_info
 from musetalk.utils.face_parsing import FaceParsing
 from musetalk.utils.audio_processor import AudioProcessor
 from musetalk.utils.utils import get_file_type, get_video_fps, datagen, load_all_model
@@ -159,36 +161,44 @@ def main(args):
                 with open(crop_coord_save_path, 'wb') as f:
                     pickle.dump(coord_list, f)
             
-            print(f"Number of frames: {len(frame_list)}")         
+            print(f"Number of frames: {len(frame_list)}")
             
             # Process each frame
             input_latent_list = []
-            for bbox, frame in zip(coord_list, frame_list):
-                if bbox == coord_placeholder:
-                    continue
+            input_blending_mask_info_list = []
+            for bbox, frame in  tqdm(zip(coord_list, frame_list), total=len(coord_list)):
                 x1, y1, x2, y2 = bbox
                 if args.version == "v15":
                     y2 = y2 + args.extra_margin
                     y2 = min(y2, frame.shape[0])
+                    blending_mask, crop_bbox = get_blending_mask(frame, [x1, y1, x2, y2], upper_boundary_ratio=0.6,mode=args.parsing_mode, fp=fp)
+                else:
+                    blending_mask, crop_bbox = get_blending_mask(frame, [x1, y1, x2, y2], fp=fp)
+                input_blending_mask_info_list.append((blending_mask, crop_bbox))
+
+                if bbox == coord_placeholder:
+                    continue
                 crop_frame = frame[y1:y2, x1:x2]
                 crop_frame = cv2.resize(crop_frame, (256,256), interpolation=cv2.INTER_LANCZOS4)
                 latents = vae.get_latents_for_unet(crop_frame)
                 input_latent_list.append(latents)
-        
+
             # Smooth first and last frames
             frame_list_cycle = frame_list + frame_list[::-1]
             coord_list_cycle = coord_list + coord_list[::-1]
             input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
+            input_blending_mask_info_list = input_blending_mask_info_list + input_blending_mask_info_list[::-1]
             
             # Batch inference
             print("Starting inference")
             video_num = len(whisper_chunks)
             batch_size = args.batch_size
+            delay_frame = 0
             gen = datagen(
                 whisper_chunks=whisper_chunks,
                 vae_encode_latents=input_latent_list_cycle,
                 batch_size=batch_size,
-                delay_frame=0,
+                delay_frame=delay_frame,
                 device=device,
             )
             
@@ -204,12 +214,31 @@ def main(args):
                 recon = vae.decode_latents(pred_latents)
                 for res_frame in recon:
                     res_frame_list.append(res_frame)
-            
+            height, width, _ = frame_list[0].shape
+            temp_vid_path = f"{temp_dir}/temp_{input_basename}_{audio_basename}.mp4"
+            ffmpeg_cmd = [
+                "ffmpeg", "-y",
+                "-f", "rawvideo",
+                "-vcodec", "rawvideo",
+                "-pix_fmt", "rgb24",
+                "-s", f"{width}x{height}",
+                "-r", str(fps),
+                "-i", "-",                    # stdin 输入
+                "-an",
+                "-vcodec", "libx264",
+                "-preset", "fast",
+                "-pix_fmt", "yuv420p",
+                "-crf", "18",
+                temp_vid_path
+            ]
+
+            process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
             # Pad generated images to original video size
             print("Padding generated images to original video size")
             for i, res_frame in enumerate(tqdm(res_frame_list)):
-                bbox = coord_list_cycle[i%(len(coord_list_cycle))]
-                ori_frame = copy.deepcopy(frame_list_cycle[i%(len(frame_list_cycle))])
+                bbox = coord_list_cycle[(i+delay_frame)%(len(coord_list_cycle))]
+                ori_frame = copy.deepcopy(frame_list_cycle[(i+delay_frame)%(len(frame_list_cycle))])
+                blending_mask, crop_bbox = input_blending_mask_info_list[(i+delay_frame)%(len(coord_list_cycle))]
                 x1, y1, x2, y2 = bbox
                 if args.version == "v15":
                     y2 = y2 + args.extra_margin
@@ -218,19 +247,24 @@ def main(args):
                     res_frame = cv2.resize(res_frame.astype(np.uint8), (x2-x1, y2-y1))
                 except:
                     continue
-                
+                combine_frame = get_image_blending_from_mask_info(ori_frame, res_frame, [x1, y1, x2, y2], blending_mask, crop_bbox)
                 # Merge results with version-specific parameters
-                if args.version == "v15":
-                    combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
-                else:
-                    combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], fp=fp)
-                cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", combine_frame)
+                # if args.version == "v15":
+                #     combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp,i=i)
+                # else:
+                #     combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], fp=fp)
+
+                # Write to ffmpeg stdin
+                process.stdin.write(combine_frame.astype(np.uint8).tobytes())
+                # cv2.imwrite(f"tmp/{str(i).zfill(8)}.png", combine_frame[:,:,::-1])
 
             # Save prediction results
-            temp_vid_path = f"{temp_dir}/temp_{input_basename}_{audio_basename}.mp4"
-            cmd_img2video = f"ffmpeg -y -v warning -r {fps} -f image2 -i {result_img_save_path}/%08d.png -vcodec libx264 -vf format=yuv420p -crf 18 {temp_vid_path}"
-            print("Video generation command:", cmd_img2video)
-            os.system(cmd_img2video)   
+            # cmd_img2video = f"ffmpeg -y -v warning -r {fps} -f image2 -i {result_img_save_path}/%08d.png -vcodec libx264 -vf format=yuv420p -crf 18 {temp_vid_path}"
+            # print("Video generation command:", cmd_img2video)
+            # os.system(cmd_img2video)
+            process.stdin.close()
+            process.wait()
+            print("Video saved to", temp_vid_path)
             
             cmd_combine_audio = f"ffmpeg -y -v warning -i {audio_path} -i {temp_vid_path} {output_vid_name}"
             print("Audio combination command:", cmd_combine_audio) 
@@ -273,4 +307,7 @@ if __name__ == "__main__":
     parser.add_argument("--right_cheek_width", type=int, default=90, help="Width of right cheek region")
     parser.add_argument("--version", type=str, default="v15", choices=["v1", "v15"], help="Model version to use")
     args = parser.parse_args()
+    # with cProfile.Profile() as pr:
     main(args)
+    # stats = pstats.Stats(pr)
+    # stats.sort_stats("tottime").print_stats(30)
