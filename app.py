@@ -221,7 +221,7 @@ def infer(pe, vae, unet, timesteps, audio_processor, whisper,
     args_dict = {
         "result_dir": './results/output', 
         "fps": 25, 
-        "batch_size": 8, 
+        "batch_size": 32, 
         "output_vid_name": '', 
         "use_saved_coord": False,
         "audio_padding_length_left": 2,
